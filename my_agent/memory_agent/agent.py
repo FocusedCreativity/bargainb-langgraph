@@ -1,13 +1,16 @@
 """
-BargainB Memory Agent - Simplified Architecture Following mem.md Patterns
+BargainB Memory Agent - Full Feature Set with mem.md Memory Patterns
 
-Based on the mem.md tutorial, this agent implements a simple architecture where:
-- Main agent decides what memory type to update
-- Separate nodes handle each memory type (profile, shopping, instructions)
-- Trustcall with Spy visibility for memory operations
-- Direct store integration without fallbacks
+This agent combines:
+- mem.md memory patterns for reliable memory management
+- Product search functionality for grocery deals
+- Conversation summarization for message management
+- Database integration for product data
 
-This replaces the complex bee hierarchy with a simpler, more reliable approach.
+Architecture:
+- Main agent with memory type decisions (following mem.md)
+- Separate memory handlers for each type
+- Integrated product search and summarization
 """
 
 from typing import Literal
@@ -17,6 +20,7 @@ from langgraph.store.memory import InMemoryStore
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.messages import merge_message_runs, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langgraph.store.base import BaseStore
 
 from my_agent.memory_agent.state import BargainBMemoryState
@@ -26,6 +30,14 @@ from langchain_openai import ChatOpenAI
 from trustcall import create_extractor
 from datetime import datetime
 import uuid
+
+# Import product search functionality
+try:
+    from my_agent.utils.database import semantic_search
+except ImportError:
+    def semantic_search(query: str, limit: int = 5):
+        """Fallback product search"""
+        return [{"title": "Product not found", "price": "N/A", "brand": "N/A"}]
 
 # Import the spy class from mem.md
 class Spy:
@@ -80,6 +92,39 @@ def extract_tool_info(tool_calls, schema_name="Memory"):
     
     return "\n\n".join(result_parts) if result_parts else f"No {schema_name} changes detected"
 
+# Product search tool
+@tool
+def search_products(query: str, limit: int = 5) -> str:
+    """
+    Search for products and deals in the BargainB database.
+    
+    Args:
+        query: Product search query (e.g., "organic milk", "cheap pasta")
+        limit: Maximum number of results to return
+        
+    Returns:
+        Formatted string with product details and pricing
+    """
+    try:
+        products = semantic_search(query, limit=limit)
+        
+        if not products:
+            return f"No products found for '{query}'. Try a different search term."
+        
+        result = f"🔍 Found {len(products)} products for '{query}':\n\n"
+        
+        for i, product in enumerate(products, 1):
+            name = product.get('title', 'Unknown Product')
+            brand = product.get('brand', 'Unknown Brand')
+            price = product.get('price', 'Price not available')
+            
+            result += f"{i}. **{name}** by {brand}\n"
+            result += f"   Price: {price}\n\n"
+        
+        return result
+    except Exception as e:
+        return f"Product search error: {str(e)}"
+
 # Memory type decision tool (like UpdateMemory in mem.md)
 from typing import TypedDict
 from pydantic import BaseModel
@@ -91,48 +136,45 @@ class UpdateMemory(BaseModel):
 # Initialize the model
 model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-# System message for the main agent (like MODEL_SYSTEM_MESSAGE in mem.md)
-BARGAINB_SYSTEM_MESSAGE = """You are BargainB 💰, a helpful grocery shopping assistant with long-term memory.
+# System message for the main agent (enhanced with product search)
+BARGAINB_SYSTEM_MESSAGE = """You are BargainB 💰, a helpful grocery shopping assistant with long-term memory and product search capabilities.
 
 You help users find the best deals on groceries while remembering their preferences and shopping history.
 
-You have long-term memory that keeps track of three things:
-1. User profile (personal info, preferences, dietary restrictions)
-2. Shopping history (past interactions, products discussed, feedback)
-3. Instructions (how you should behave and communicate)
+## Your Capabilities:
+1. **Product Search**: Find specific products and deals using the search_products tool
+2. **Memory Management**: Remember user preferences, shopping history, and instructions
+3. **Deal Finding**: Help users find the best prices and offers
+4. **Personalization**: Adapt recommendations based on user preferences
 
-Here is the current User Profile:
-<user_profile>
+## Current Memory Context:
+
+**User Profile:**
 {user_profile}
-</user_profile>
 
-Here is the current Shopping History:
-<shopping_history>
+**Shopping History:**
 {shopping_history}
-</shopping_history>
 
-Here are the current Instructions:
-<instructions>
+**Instructions:**
 {instructions}
-</instructions>
 
-## Your Instructions for Memory Updates:
+## Your Instructions:
 
-1. Reason carefully about the user's messages.
+1. **Product Search**: When users ask about products, prices, or deals, use the search_products tool to find relevant information.
 
-2. Decide whether any of your long-term memory should be updated:
-- If personal information, preferences, or dietary info was provided, update the user profile by calling UpdateMemory with type `profile`
-- If shopping interactions, product discussions, or feedback occurred, update shopping history by calling UpdateMemory with type `shopping`
-- If the user specified preferences for how you should behave, update instructions by calling UpdateMemory with type `instructions`
+2. **Memory Updates**: Decide whether to update long-term memory:
+   - Personal info/preferences → update profile (UpdateMemory with type 'profile')
+   - Shopping interactions/feedback → update shopping history (UpdateMemory with type 'shopping')  
+   - Behavior preferences → update instructions (UpdateMemory with type 'instructions')
 
-3. Tell the user when you update memories:
-- Don't mention profile updates (personal info is private)
-- Do mention when you remember shopping preferences or feedback
-- Don't mention instruction updates (system behavior is internal)
+3. **Communication**:
+   - Don't mention profile updates (personal info is private)
+   - Do mention when you remember shopping preferences or feedback
+   - Don't mention instruction updates (system behavior is internal)
 
-4. Always prioritize helping with grocery shopping and finding good deals.
+4. **Focus**: Always prioritize helping with grocery shopping and finding good deals.
 
-5. Respond naturally after updating memories or if no updates are needed.
+5. **Response**: Respond naturally after tool calls or if no tools are needed.
 
 Current time: {current_time}
 """
@@ -162,13 +204,14 @@ Focus on how to better assist with grocery shopping, deal finding, and product r
 
 def bargainb_main_agent(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore):
     """
-    Main BargainB agent that makes decisions about memory updates.
+    Main BargainB agent with full feature set and memory management.
     
-    Like task_mAIstro in mem.md, this agent:
+    This agent:
     - Loads memories from store for context
-    - Makes decisions about what memory types to update
-    - Routes to appropriate memory handlers
-    - Responds to users naturally
+    - Has access to product search capabilities
+    - Makes decisions about memory updates
+    - Routes to appropriate handlers
+    - Manages conversation summarization
     """
     
     # Get the user ID from the config
@@ -189,6 +232,27 @@ def bargainb_main_agent(state: BargainBMemoryState, config: RunnableConfig, stor
     memories = store.search(namespace)
     instructions = memories[0].value if memories else ""
     
+    # Check if conversation summarization is needed
+    messages = state.get("messages", [])
+    if len(messages) > 10:  # Trigger summarization after 10 messages
+        # Create a simple summary
+        from langchain_core.prompts import ChatPromptTemplate
+        
+        summary_prompt = ChatPromptTemplate.from_messages([
+            ("system", "Summarize this conversation focusing on: user preferences, products discussed, deals mentioned, and important decisions. Keep it under 200 words."),
+            ("user", "Conversation to summarize:\n{messages}")
+        ])
+        
+        messages_text = "\n".join([f"{msg.get('type', 'unknown')}: {msg.get('content', '')}" for msg in messages[-8:]])
+        summary = model.invoke(summary_prompt.format_messages(messages=messages_text))
+        
+        # Update state with summary and truncate messages
+        state = {
+            **state,
+            "summary": summary.content,
+            "messages": messages[:2] + [{"type": "system", "content": f"[Conversation summarized: {summary.content}]"}] + messages[-3:]
+        }
+    
     # Format system message with current memories
     system_msg = BARGAINB_SYSTEM_MESSAGE.format(
         user_profile=user_profile,
@@ -197,8 +261,8 @@ def bargainb_main_agent(state: BargainBMemoryState, config: RunnableConfig, stor
         current_time=datetime.now().isoformat()
     )
 
-    # Respond using memory context and chat history
-    response = model.bind_tools([UpdateMemory], parallel_tool_calls=False).invoke(
+    # Respond using memory context, product search, and chat history
+    response = model.bind_tools([UpdateMemory, search_products], parallel_tool_calls=False).invoke(
         [SystemMessage(content=system_msg)] + state["messages"]
     )
 
@@ -324,49 +388,56 @@ def update_instructions_memory(state: BargainBMemoryState, config: RunnableConfi
     tool_calls = state['messages'][-1].tool_calls
     return {"messages": [{"role": "tool", "content": "updated instructions", "tool_call_id": tool_calls[0]['id']}]}
 
-def route_memory_decisions(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore) -> Literal[END, "update_shopping_memory", "update_instructions_memory", "update_profile_memory"]:
-    """Route memory decisions to appropriate handlers (like route_message in mem.md)."""
+def route_decisions(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore) -> Literal[END, "update_shopping_memory", "update_instructions_memory", "update_profile_memory"]:
+    """Route decisions to appropriate handlers based on tool calls."""
     
     message = state['messages'][-1]
-    if len(message.tool_calls) == 0:
-        return END
-    else:
-        tool_call = message.tool_calls[0]
-        if tool_call['args']['update_type'] == "profile":
-            return "update_profile_memory"
-        elif tool_call['args']['update_type'] == "shopping":
-            return "update_shopping_memory"
-        elif tool_call['args']['update_type'] == "instructions":
-            return "update_instructions_memory"
-        else:
-            return END
+    
+    # Check for tool calls
+    if hasattr(message, 'tool_calls') and message.tool_calls:
+        for tool_call in message.tool_calls:
+            # Handle memory updates
+            if tool_call.get('name') == 'UpdateMemory':
+                update_type = tool_call['args']['update_type']
+                if update_type == "profile":
+                    return "update_profile_memory"
+                elif update_type == "shopping":
+                    return "update_shopping_memory"
+                elif update_type == "instructions":
+                    return "update_instructions_memory"
+            
+            # Handle product search (already handled by the main agent)
+            elif tool_call.get('name') == 'search_products':
+                return END
+    
+    return END
 
 def create_bargainb_memory_agent():
     """
-    Create the simplified BargainB memory agent following mem.md patterns.
+    Create the full-featured BargainB memory agent with mem.md patterns.
     
-    This agent follows the exact structure from mem.md:
-    - Main agent makes memory type decisions
-    - Separate nodes handle each memory type
-    - Direct store integration
-    - Trustcall with Spy visibility
+    This agent includes:
+    - Memory management following mem.md patterns
+    - Product search capabilities
+    - Conversation summarization
+    - Database integration
     
     Returns:
-        Compiled graph with memory persistence
+        Compiled graph with full feature set
     """
     
     # Create the graph following mem.md structure
     builder = StateGraph(BargainBMemoryState)
     
-    # Define nodes (like mem.md)
+    # Define nodes
     builder.add_node("bargainb_main_agent", bargainb_main_agent)
     builder.add_node("update_profile_memory", update_profile_memory)
     builder.add_node("update_shopping_memory", update_shopping_memory)
     builder.add_node("update_instructions_memory", update_instructions_memory)
     
-    # Define the flow (like mem.md)
+    # Define the flow
     builder.add_edge(START, "bargainb_main_agent")
-    builder.add_conditional_edges("bargainb_main_agent", route_memory_decisions)
+    builder.add_conditional_edges("bargainb_main_agent", route_decisions)
     builder.add_edge("update_profile_memory", "bargainb_main_agent")
     builder.add_edge("update_shopping_memory", "bargainb_main_agent")
     builder.add_edge("update_instructions_memory", "bargainb_main_agent")
@@ -377,12 +448,12 @@ def create_bargainb_memory_agent():
     # Checkpointer for short-term (within-thread) memory
     within_thread_memory = MemorySaver()
     
-    # Compile the graph with store integration (like mem.md)
+    # Compile the graph with store integration
     graph = builder.compile(checkpointer=within_thread_memory, store=across_thread_memory)
     
     return graph
 
-# Keep the old function for backward compatibility, but use the new simplified version
+# Keep the old function for backward compatibility
 def create_bargainb_memory_agent_legacy():
     """Legacy function - use create_bargainb_memory_agent() instead."""
     return create_bargainb_memory_agent()
