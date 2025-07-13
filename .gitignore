@@ -91,7 +91,3 @@ temp/
 *.pyc
 *.pyo
 .DS_Store
-
-# LangGraph API and virtual environments
-.langgraph_api/
-venv_langgraph_test/
