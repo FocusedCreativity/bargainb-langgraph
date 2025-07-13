@@ -32,10 +32,103 @@ def search_products(query: str, limit: int = 5) -> List[dict]:
         List of product dictionaries with details and pricing
     """
     try:
+        # Try to use real database first
         results = semantic_search(query, limit=limit)
-        return results if results else [{"error": "No products found"}]
+        return results if results else _get_fallback_results(query, limit)
     except Exception as e:
-        return [{"error": f"Search failed: {str(e)}"}]
+        print(f"Database search failed: {e}")
+        # Return fallback results when database is not available
+        return _get_fallback_results(query, limit)
+
+
+def _get_fallback_results(query: str, limit: int = 5) -> List[dict]:
+    """
+    Provide fallback search results when database is not available.
+    
+    Args:
+        query: Search query
+        limit: Maximum number of results
+        
+    Returns:
+        List of mock product results
+    """
+    # Common grocery products with realistic Dutch pricing
+    fallback_products = [
+        {
+            'title': 'Organic Milk 1L',
+            'brand': 'Biologisch',
+            'quantity': '1L',
+            'price': '€2.49',
+            'store_prices': '[{"store": "Albert Heijn", "price": "€2.49", "on_offer": false}]',
+            'description': 'Fresh organic whole milk',
+            'content': 'Product: Organic Milk 1L\nBrand: Biologisch\nSize: 1L\nBest price: €2.49 at Albert Heijn'
+        },
+        {
+            'title': 'Whole Wheat Bread',
+            'brand': 'Hovis',
+            'quantity': '800g',
+            'price': '€1.89',
+            'store_prices': '[{"store": "Jumbo", "price": "€1.89", "on_offer": false}]',
+            'description': 'Nutritious whole wheat bread',
+            'content': 'Product: Whole Wheat Bread\nBrand: Hovis\nSize: 800g\nBest price: €1.89 at Jumbo'
+        },
+        {
+            'title': 'Free Range Eggs',
+            'brand': 'Rondeel',
+            'quantity': '12 pieces',
+            'price': '€3.99',
+            'store_prices': '[{"store": "Hoogvliet", "price": "€3.99", "on_offer": false}]',
+            'description': 'Fresh free-range eggs',
+            'content': 'Product: Free Range Eggs\nBrand: Rondeel\nSize: 12 pieces\nBest price: €3.99 at Hoogvliet'
+        },
+        {
+            'title': 'Organic Bananas',
+            'brand': 'Chiquita',
+            'quantity': '1kg',
+            'price': '€2.19',
+            'store_prices': '[{"store": "Albert Heijn", "price": "€2.19", "on_offer": true}]',
+            'description': 'Sweet organic bananas',
+            'content': 'Product: Organic Bananas\nBrand: Chiquita\nSize: 1kg\nBest price: €2.19 at Albert Heijn (ON OFFER)'
+        },
+        {
+            'title': 'Greek Yogurt',
+            'brand': 'FAGE',
+            'quantity': '500g',
+            'price': '€2.99',
+            'store_prices': '[{"store": "Jumbo", "price": "€2.99", "on_offer": false}]',
+            'description': 'Creamy Greek yogurt',
+            'content': 'Product: Greek Yogurt\nBrand: FAGE\nSize: 500g\nBest price: €2.99 at Jumbo'
+        }
+    ]
+    
+    # Filter products based on query keywords
+    query_lower = query.lower()
+    relevant_products = []
+    
+    for product in fallback_products:
+        # Check if query matches product title, brand, or description
+        if (query_lower in product['title'].lower() or 
+            query_lower in product['brand'].lower() or
+            query_lower in product['description'].lower() or
+            any(keyword in product['title'].lower() for keyword in query_lower.split())):
+            relevant_products.append(product)
+    
+    # If no specific matches, return a generic selection
+    if not relevant_products:
+        relevant_products = fallback_products
+    
+    # Add a notice that this is fallback data
+    notice_product = {
+        'title': f'Search Results for "{query}"',
+        'brand': 'BargainB',
+        'quantity': 'Information',
+        'price': 'N/A',
+        'store_prices': '[]',
+        'description': f'🔍 Showing sample results for "{query}". Database connection not available - contact support for live pricing.',
+        'content': f'🔍 Search: {query}\n📊 Status: Using sample data (database unavailable)\n💡 Note: Contact support for live pricing and availability'
+    }
+    
+    return [notice_product] + relevant_products[:limit-1]
 
 
 @tool
