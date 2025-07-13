@@ -1,0 +1,17 @@
+{
+    "dependencies": [
+        "langchain_openai",
+        "langchain_core", 
+        "langgraph",
+        "asyncpg",
+        "trustcall",
+        "./my_agent"
+    ],
+    "graphs": {
+        "self_rag_agent": "./my_agent/agent.py:graph",
+        "memory_agent": "./my_agent/memory_agent/agent.py:memory_agent"
+    },
+    "env": "./.env",
+    "python_version": "3.12",
+    "dockerfile_lines": []
+}

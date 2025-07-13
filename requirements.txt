@@ -1,0 +1,15 @@
+langgraph
+langchain-core
+langchain-community
+langchain-openai
+langchain-text-splitters
+langchain
+beautifulsoup4
+lxml
+faiss-cpu
+tiktoken
+psycopg2-binary
+sqlalchemy
+asyncpg
+trustcall
+
