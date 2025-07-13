@@ -87,4 +87,11 @@ temp/
 *.temp
 
 # LangSmith/LangChain cache
-.langchain/ 
+.langchain/ __pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# LangGraph API and virtual environments
+.langgraph_api/
+venv_langgraph_test/

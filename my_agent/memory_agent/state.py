@@ -2,29 +2,11 @@
 BargainB Memory Agent State
 
 Defines the state structure for the memory agent that handles
-user personalization and long-term memory management.
+user personalization and long-term memory management with the bee hive architecture.
 """
 
 from typing import TypedDict, List, Optional, Dict, Any, Literal, Annotated
 from langgraph.graph import MessagesState
-
-
-def update_dialog_stack(left: List[str], right: Optional[str]) -> List[str]:
-    """
-    Manage the dialog state stack for delegation between assistants.
-    
-    Args:
-        left: Current dialog state stack
-        right: Operation to perform ('pop' to return, assistant name to delegate, None to maintain)
-    
-    Returns:
-        Updated dialog state stack
-    """
-    if right is None:
-        return left
-    if right == "pop":
-        return left[:-1]
-    return left + [right]
 
 
 class BargainBMemoryState(MessagesState):
@@ -34,6 +16,7 @@ class BargainBMemoryState(MessagesState):
     - Memory context for personalization
     - User identification for memory persistence
     - Conversation summarization for message management
+    - Bee hive coordination state
     """
     
     # User identification
@@ -41,13 +24,7 @@ class BargainBMemoryState(MessagesState):
     thread_id: Optional[str] = None
     conversation_id: Optional[str] = None
     
-    # Dialog state stack for delegation management (Beeb -> Product Search)
-    dialog_state: Annotated[
-        List[Literal["beeb_assistant", "product_search"]], 
-        update_dialog_stack
-    ] = []
-    
-    # Conversation summarization (like in the notebook)
+    # Conversation summarization (like in the tutorial)
     summary: Optional[str] = None
     
     # Current memory context (loaded from store)
@@ -67,4 +44,19 @@ class BargainBMemoryState(MessagesState):
     
     # Message management
     messages_since_last_summary: int = 0
-    should_summarize: bool = False 
+    should_summarize: bool = False
+    
+    # Bee hive coordination (for tracking which bee is currently active)
+    current_bee: Optional[Literal["beeb", "scout_bee", "memory_bee", "scribe_bee"]] = "beeb"
+    
+    # Task delegation context
+    delegation_context: Optional[Dict[str, Any]] = None
+    
+    # Worker bee results (for passing results back to Beeb)
+    scout_results: Optional[str] = None
+    memory_results: Optional[str] = None  # Updated field name
+    scribe_results: Optional[str] = None
+    
+    # Delegation tracking to prevent infinite loops
+    delegation_completed: bool = False
+    iteration_count: int = 0 

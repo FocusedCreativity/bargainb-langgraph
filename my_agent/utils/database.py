@@ -29,12 +29,15 @@ class BargainBDatabase:
         project_ref = parsed_url.hostname.split('.')[0]
         
         self.connection_params = {
-            'host': 'aws-0-eu-west-3.pooler.supabase.com',
-            'port': 6543,
+            'host': f'aws-0-eu-west-3.pooler.supabase.com',  # Use session pooler for IPv4 compatibility
+            'port': 5432,  # Session pooler port
             'database': 'postgres',
-            'user': 'postgres.oumhprsxyxnocgbzosvh',
+            'user': f'postgres.{project_ref}',  # Use project-specific user for pooler
             'password': os.getenv('DB_PASSWORD', 'AfdalX@20202'),  # Use the password from memory
-            'ssl': 'require',  # Supabase requires SSL
+            'ssl': 'prefer',  # Use prefer instead of require to avoid SSL issues
+            'server_settings': {
+                'application_name': 'BargainB_Agent'
+            }
         }
         
         print(f"🔗 Connecting to Supabase database: {project_ref}")
@@ -411,24 +414,36 @@ def semantic_search(query: str, limit: int = 10) -> List[dict]:
     Returns:
         List of product dictionaries with pricing and details
     """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    import asyncio
     
     async def _search():
+        db = BargainBDatabase()
         await db.connect()
         try:
             documents = await db.semantic_product_search(query, limit=limit)
             # Convert Documents to dictionaries for easier use
             results = []
             for doc in documents:
+                store_prices_json = _extract_store_prices_from_doc(doc)
+                
+                # Extract simple price from store_prices for compatibility
+                import json
+                import re
+                try:
+                    store_prices = json.loads(store_prices_json)
+                    simple_price = store_prices[0]['price'] if store_prices else 'Price not available'
+                except:
+                    # Extract price from content as fallback
+                    content = doc.page_content
+                    price_match = re.search(r'Best price: €([\d.,]+)', content)
+                    simple_price = f"€{price_match.group(1)}" if price_match else 'Price not available'
+                
                 result = {
                     'title': doc.metadata.get('title', 'Unknown Product'),
                     'brand': doc.metadata.get('brand', 'Unknown Brand'),
                     'quantity': doc.metadata.get('quantity', 'Unknown size'),
-                    'store_prices': _extract_store_prices_from_doc(doc),
+                    'price': simple_price,  # Simple price field for compatibility
+                    'store_prices': store_prices_json,  # Detailed store prices JSON
                     'description': doc.metadata.get('description', ''),
                     'category': doc.metadata.get('category_path', 'Unknown'),
                     'gtin': doc.metadata.get('gtin', ''),
@@ -439,7 +454,42 @@ def semantic_search(query: str, limit: int = 10) -> List[dict]:
         finally:
             await db.disconnect()
     
-    return loop.run_until_complete(_search())
+    # Simplified approach - just use asyncio.run
+    try:
+        return asyncio.run(_search())
+    except RuntimeError as e:
+        if "cannot be called from a running event loop" in str(e):
+            # If we're in a running event loop, create a new thread
+            import threading
+            import queue
+            
+            result_queue = queue.Queue()
+            exception_queue = queue.Queue()
+            
+            def run_search():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    result = loop.run_until_complete(_search())
+                    result_queue.put(result)
+                except Exception as e:
+                    exception_queue.put(e)
+                finally:
+                    loop.close()
+            
+            thread = threading.Thread(target=run_search)
+            thread.start()
+            thread.join(timeout=30)  # 30 second timeout
+            
+            if not exception_queue.empty():
+                raise exception_queue.get()
+            
+            if not result_queue.empty():
+                return result_queue.get()
+            else:
+                raise TimeoutError("Database search timed out")
+        else:
+            raise
 
 
 def _extract_store_prices_from_doc(doc: Document) -> str:
@@ -453,8 +503,27 @@ def _extract_store_prices_from_doc(doc: Document) -> str:
         JSON string with store pricing information
     """
     import json
+    import re
     
-    # Extract basic pricing info from metadata
+    # Extract pricing info from content field
+    content = doc.page_content
+    
+    # Extract best price using regex
+    best_price_match = re.search(r'Best price: €([\d.,]+) at ([^\\n]+)', content)
+    if best_price_match:
+        price = best_price_match.group(1)
+        store = best_price_match.group(2)
+        
+        # Create price info structure  
+        price_info = [{
+            'store': store,
+            'price': f"€{price}",
+            'on_offer': False  # Default to false since we don't have promo price info
+        }]
+        
+        return json.dumps(price_info)
+    
+    # Fallback to metadata if no content match
     price = doc.metadata.get('price', 0)
     store = doc.metadata.get('store_name', 'Unknown Store')
     
