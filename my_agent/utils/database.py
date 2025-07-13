@@ -8,6 +8,7 @@ from typing import List, Dict, Any, Optional
 import asyncpg
 from langchain_core.documents import Document
 from urllib.parse import urlparse
+from datetime import datetime
 
 class BargainBDatabase:
     """Database connection and query utility for BargainB on Supabase."""
@@ -693,3 +694,65 @@ def _extract_store_prices_from_doc(doc: Document) -> str:
     }]
     
     return json.dumps(price_info) 
+
+
+def get_supabase_client():
+    """Get a Supabase client for direct database access."""
+    try:
+        from supabase import create_client, Client
+        
+        supabase_url = os.getenv('SUPABASE_URL')
+        supabase_key = os.getenv('SUPABASE_SERVICE_ROLE_KEY')
+        
+        if not supabase_url or not supabase_key:
+            print("⚠️  Supabase credentials not found in environment variables")
+            return None
+            
+        client: Client = create_client(supabase_url, supabase_key)
+        return client
+        
+    except ImportError:
+        print("⚠️  Supabase client not installed. Install with: pip install supabase")
+        return None
+    except Exception as e:
+        print(f"⚠️  Failed to create Supabase client: {e}")
+        return None
+
+def log_message_truncation(user_id: str, thread_id: str, original_count: int, truncated_count: int, summary: str):
+    """
+    Log message truncation event to the Supabase database.
+    
+    Args:
+        user_id: User identifier
+        thread_id: Thread identifier
+        original_count: Original message count
+        truncated_count: Number of messages truncated
+        summary: Generated summary
+    """
+    try:
+        # Use the existing database connection pattern
+        db = BargainBDatabase()
+        
+        # Run the logging in an async context
+        async def _log_truncation():
+            try:
+                await db.connect()
+                
+                # Insert truncation log using asyncpg
+                await db.connection.execute("""
+                    INSERT INTO message_truncation_log (
+                        user_id, thread_id, original_count, truncated_count, summary, created_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6)
+                """, user_id, thread_id, original_count, truncated_count, summary, datetime.now())
+                
+                await db.disconnect()
+                
+            except Exception as e:
+                print(f"Error logging message truncation: {e}")
+                await db.disconnect()
+        
+        # Run the async function
+        asyncio.run(_log_truncation())
+        
+    except Exception as e:
+        print(f"Error in log_message_truncation: {e}") 

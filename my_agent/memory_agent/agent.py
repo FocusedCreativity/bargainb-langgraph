@@ -1,45 +1,101 @@
 """
-BargainB Memory Agent - Full Feature Set with mem.md Memory Patterns
+BargainB Memory Agent - Bee Delegation System with Memory & Summarization
 
-This agent combines:
-- mem.md memory patterns for reliable memory management
-- Product search functionality for grocery deals
-- Conversation summarization for message management
-- Database integration for product data
-
-Architecture:
-- Main agent with memory type decisions (following mem.md)
-- Separate memory handlers for each type
-- Integrated product search and summarization
+This agent uses the bee delegation system with:
+- Beeb Supervisor 🐝👑: Main interface and coordination
+- Scout Bee 🐝🔍: Product search and price comparison
+- Memory Bee 🐝🧠: Memory management and personalization
+- Scribe Bee 🐝📝: Conversation summarization
+- Database integration for product data and memory persistence
 """
 
 from typing import Literal
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.store.memory import InMemoryStore
-
 from langchain_core.runnables import RunnableConfig
-from langchain_core.messages import merge_message_runs, HumanMessage, SystemMessage
+from langchain_core.messages import merge_message_runs, HumanMessage, SystemMessage, RemoveMessage
 from langchain_core.tools import tool
-from langgraph.store.base import BaseStore
-
-from my_agent.memory_agent.state import BargainBMemoryState
-from my_agent.memory_agent.schemas import UserProfile, ShoppingMemory, Instructions
 
 from langchain_openai import ChatOpenAI
 from trustcall import create_extractor
 from datetime import datetime
 import uuid
 
-# Import product search functionality
-try:
-    from my_agent.utils.database import semantic_search
-except ImportError:
-    def semantic_search(query: str, limit: int = 5):
-        """Fallback product search"""
-        return [{"title": "Product not found", "price": "N/A", "brand": "N/A"}]
+# Import state and schemas
+from my_agent.memory_agent.state import BargainBMemoryState
+from my_agent.memory_agent.schemas import UserProfile, ShoppingMemory, Instructions
 
-# Import the spy class from mem.md
+# Import bee system components
+from my_agent.memory_agent.beeb_supervisor import (
+    create_beeb_supervisor,
+    _format_semantic_memory,
+    _format_episodic_memories,
+    _format_procedural_memory
+)
+from my_agent.memory_agent.scout_bee import create_scout_bee
+from my_agent.memory_agent.memory_bee import create_memory_bee
+from my_agent.memory_agent.scribe_bee import create_scribe_bee
+
+# Import database utilities
+try:
+    from my_agent.utils.database import log_message_truncation
+except ImportError:
+    def log_message_truncation(user_id: str, thread_id: str, original_count: int, truncated_count: int, summary: str):
+        print(f"📝 Mock log: Truncated {original_count} to {truncated_count} messages for {user_id}")
+
+# Import persistence layer for conversation summaries
+from my_agent.memory_agent.simple_persistence import (
+    save_conversation_summary,
+    get_conversation_summary,
+    log_message_truncation as log_truncation_db
+)
+
+# Missing constants from mem.md patterns
+TRUSTCALL_INSTRUCTION = """Reflect on following interaction. 
+
+Use the provided tools to retain any necessary memories about the user. 
+
+Use parallel tool calling to handle updates and insertions simultaneously.
+
+System Time: {time}"""
+
+CREATE_INSTRUCTIONS = """Reflect on the following interaction.
+
+Based on this interaction, update your instructions for how to update ToDo list items. 
+
+Use any feedback from the user to update how they like to have items added, etc.
+
+Your current instructions are:
+
+<current_instructions>
+{current_instructions}
+</current_instructions>"""
+
+# Initialize the language model
+model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+# Create extractors for each memory type following mem.md patterns
+user_profile_extractor = create_extractor(
+    model,
+    tools=[UserProfile],
+    tool_choice="UserProfile",
+    enable_inserts=True,
+)
+
+shopping_memory_extractor = create_extractor(
+    model,
+    tools=[ShoppingMemory],
+    tool_choice="ShoppingMemory",
+    enable_inserts=True,
+)
+
+instructions_extractor = create_extractor(
+    model,
+    tools=[Instructions],
+    tool_choice="Instructions",
+    enable_inserts=True,
+)
+
+# Spy class from mem.md for visibility into Trustcall updates
 class Spy:
     def __init__(self):
         self.called_tools = []
@@ -48,227 +104,246 @@ class Spy:
         # Collect information about the tool calls made by the extractor.
         q = [run]
         while q:
-            r = q.pop()
-            if r.child_runs:
-                q.extend(r.child_runs)
-            if r.run_type == "chat_model":
-                self.called_tools.append(
-                    r.outputs["generations"][0][0]["message"]["kwargs"]["tool_calls"]
+            run = q.pop()
+            if hasattr(run, 'tool_calls') and run.tool_calls:
+                self.called_tools.extend(
+                    [
+                        {
+                            "name": tool_call["name"],
+                            "args": tool_call["args"],
+                        }
+                        for tool_call in run.tool_calls
+                    ]
                 )
+            if hasattr(run, 'steps'):
+                for step in run.steps:
+                    q.append(step)
 
 def extract_tool_info(tool_calls, schema_name="Memory"):
-    """Extract information from tool calls for both patches and new memories."""
-    changes = []
-    
-    for call_group in tool_calls:
-        for call in call_group:
-            if call['name'] == 'PatchDoc':
-                changes.append({
-                    'type': 'update',
-                    'doc_id': call['args']['json_doc_id'],
-                    'planned_edits': call['args']['planned_edits'],
-                    'value': call['args']['patches'][0]['value']
-                })
-            elif call['name'] == schema_name:
-                changes.append({
-                    'type': 'new',
-                    'value': call['args']
-                })
+    """Extract tool information from Trustcall runs"""
+    return [
+        {
+            "tool_name": tool_call.get("name", "Unknown"),
+            "args": tool_call.get("args", {}),
+            "schema": schema_name
+        }
+        for tool_call in tool_calls
+    ]
 
-    # Format results as a single string
-    result_parts = []
-    for change in changes:
-        if change['type'] == 'update':
-            result_parts.append(
-                f"Document {change['doc_id']} updated:\n"
-                f"Plan: {change['planned_edits']}\n"
-                f"Updated content: {change['value']}"
-            )
-        else:
-            result_parts.append(
-                f"New {schema_name} created:\n"
-                f"Content: {change['value']}"
-            )
-    
-    return "\n\n".join(result_parts) if result_parts else f"No {schema_name} changes detected"
+# Initialize bee system components
+beeb_supervisor = create_beeb_supervisor()
+scout_bee = create_scout_bee()
+memory_bee = create_memory_bee()
+scribe_bee = create_scribe_bee()
 
-# Product search tool
-@tool
-def search_products(query: str, limit: int = 5) -> str:
+def beeb_main_node(state: BargainBMemoryState, config: RunnableConfig):
     """
-    Search for products and deals in the BargainB database.
+    Main Beeb supervisor node that coordinates all worker bees.
     
-    Args:
-        query: Product search query (e.g., "organic milk", "cheap pasta")
-        limit: Maximum number of results to return
-        
-    Returns:
-        Formatted string with product details and pricing
-    """
-    try:
-        products = semantic_search(query, limit=limit)
-        
-        if not products:
-            return f"No products found for '{query}'. Try a different search term."
-        
-        result = f"🔍 Found {len(products)} products for '{query}':\n\n"
-        
-        for i, product in enumerate(products, 1):
-            name = product.get('title', 'Unknown Product')
-            brand = product.get('brand', 'Unknown Brand')
-            price = product.get('price', 'Price not available')
-            
-            result += f"{i}. **{name}** by {brand}\n"
-            result += f"   Price: {price}\n\n"
-        
-        return result
-    except Exception as e:
-        return f"Product search error: {str(e)}"
-
-# Memory type decision tool (like UpdateMemory in mem.md)
-from typing import TypedDict
-from pydantic import BaseModel
-
-class UpdateMemory(BaseModel):
-    """Decision on what memory type to update"""
-    update_type: Literal['profile', 'shopping', 'instructions']
-
-# Initialize the model
-model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-
-# System message for the main agent (enhanced with product search)
-BARGAINB_SYSTEM_MESSAGE = """You are BargainB 💰, a helpful grocery shopping assistant with long-term memory and product search capabilities.
-
-You help users find the best deals on groceries while remembering their preferences and shopping history.
-
-## Your Capabilities:
-1. **Product Search**: Find specific products and deals using the search_products tool
-2. **Memory Management**: Remember user preferences, shopping history, and instructions
-3. **Deal Finding**: Help users find the best prices and offers
-4. **Personalization**: Adapt recommendations based on user preferences
-
-## Current Memory Context:
-
-**User Profile:**
-{user_profile}
-
-**Shopping History:**
-{shopping_history}
-
-**Instructions:**
-{instructions}
-
-## Your Instructions:
-
-1. **Product Search**: When users ask about products, prices, or deals, use the search_products tool to find relevant information.
-
-2. **Memory Updates**: Decide whether to update long-term memory:
-   - Personal info/preferences → update profile (UpdateMemory with type 'profile')
-   - Shopping interactions/feedback → update shopping history (UpdateMemory with type 'shopping')  
-   - Behavior preferences → update instructions (UpdateMemory with type 'instructions')
-
-3. **Communication**:
-   - Don't mention profile updates (personal info is private)
-   - Do mention when you remember shopping preferences or feedback
-   - Don't mention instruction updates (system behavior is internal)
-
-4. **Focus**: Always prioritize helping with grocery shopping and finding good deals.
-
-5. **Response**: Respond naturally after tool calls or if no tools are needed.
-
-Current time: {current_time}
-"""
-
-# Trustcall instruction (like mem.md)
-TRUSTCALL_INSTRUCTION = """Reflect on the following interaction and extract relevant information for BargainB's memory system.
-
-Use the provided tools to retain necessary information about the user's grocery shopping needs.
-
-Use parallel tool calling to handle updates and insertions simultaneously.
-
-Focus on actionable information that will help personalize future shopping assistance.
-
-System Time: {time}"""
-
-# Instructions for updating system behavior (like mem.md)
-CREATE_INSTRUCTIONS = """Reflect on the following interaction and update your instructions for how to help this user with grocery shopping.
-
-Based on this interaction, update your behavior preferences, communication style, and personalization approach.
-
-Your current instructions are:
-<current_instructions>
-{current_instructions}
-</current_instructions>
-
-Focus on how to better assist with grocery shopping, deal finding, and product recommendations."""
-
-def bargainb_main_agent(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore):
-    """
-    Main BargainB agent with full feature set and memory management.
-    
-    This agent:
-    - Loads memories from store for context
-    - Has access to product search capabilities
-    - Makes decisions about memory updates
-    - Routes to appropriate handlers
-    - Manages conversation summarization
+    This node:
+    - Loads conversation summary from database
+    - Uses Beeb supervisor to coordinate worker bees
+    - Handles delegation to Scout, Memory, and Scribe bees
+    - Maintains conversation continuity
     """
     
     # Get the user ID from the config
-    user_id = config["configurable"]["user_id"]
+    user_id = config["configurable"].get("user_id", "default")
+    thread_id = config["configurable"].get("thread_id", "default")
+    conversation_id = f"{user_id}_{thread_id}"
 
-    # Retrieve profile memory from the store
-    namespace = ("profile", user_id)
-    memories = store.search(namespace)
-    user_profile = memories[0].value if memories else None
-
-    # Retrieve shopping memory from the store
-    namespace = ("shopping", user_id)
-    memories = store.search(namespace)
-    shopping_history = "\n".join(f"- {mem.value}" for mem in memories[-5:])  # Last 5 interactions
-
-    # Retrieve instructions
-    namespace = ("instructions", user_id)
-    memories = store.search(namespace)
-    instructions = memories[0].value if memories else ""
+    # Load conversation summary from database (following external DB memory pattern)
+    summary = state.get("summary", "")
+    if not summary:
+        # Try to load from database if not in state
+        try:
+            db_summary = get_conversation_summary(conversation_id)
+            if db_summary:
+                summary = db_summary
+                print(f"📝 Beeb: Loaded conversation summary from database for {conversation_id}")
+        except Exception as e:
+            print(f"❌ Beeb: Failed to load conversation summary: {e}")
     
-    # Check if conversation summarization is needed
-    messages = state.get("messages", [])
-    if len(messages) > 10:  # Trigger summarization after 10 messages
-        # Create a simple summary
-        from langchain_core.prompts import ChatPromptTemplate
-        
-        summary_prompt = ChatPromptTemplate.from_messages([
-            ("system", "Summarize this conversation focusing on: user preferences, products discussed, deals mentioned, and important decisions. Keep it under 200 words."),
-            ("user", "Conversation to summarize:\n{messages}")
-        ])
-        
-        messages_text = "\n".join([f"{msg.get('type', 'unknown')}: {msg.get('content', '')}" for msg in messages[-8:]])
-        summary = model.invoke(summary_prompt.format_messages(messages=messages_text))
-        
-        # Update state with summary and truncate messages
-        state = {
-            **state,
-            "summary": summary.content,
-            "messages": messages[:2] + [{"type": "system", "content": f"[Conversation summarized: {summary.content}]"}] + messages[-3:]
-        }
+    # For now, use empty memories for Trustcall system (separate from conversation summaries)
+    # TODO: Implement proper Trustcall memory loading when needed
+    semantic_memory = None
+    episodic_memories = []
+    procedural_memory = None
     
-    # Format system message with current memories
-    system_msg = BARGAINB_SYSTEM_MESSAGE.format(
-        user_profile=user_profile,
-        shopping_history=shopping_history,
-        instructions=instructions,
-        current_time=datetime.now().isoformat()
-    )
+    # Initialize worker bee results as empty
+    scout_results = ""
+    memory_results = ""
+    scribe_results = ""
+    
+    # Check if we have previous worker bee results in the state
+    # (This would be populated by worker bee nodes)
+    scout_results = state.get("scout_results", "")
+    memory_results = state.get("memory_results", "")
+    scribe_results = state.get("scribe_results", "")
 
-    # Respond using memory context, product search, and chat history
-    response = model.bind_tools([UpdateMemory, search_products], parallel_tool_calls=False).invoke(
-        [SystemMessage(content=system_msg)] + state["messages"]
-    )
+    # Format memory context for Beeb
+    formatted_semantic = _format_semantic_memory(semantic_memory)
+    formatted_episodic = _format_episodic_memories(episodic_memories)
+    formatted_procedural = _format_procedural_memory(procedural_memory)
 
-    return {"messages": [response]}
+    # Filter messages to only include user and assistant messages without tool calls
+    # This prevents OpenAI API errors about unresponded tool calls
+    clean_messages = []
+    for msg in state["messages"]:
+        if hasattr(msg, 'role'):
+            if msg.role == "user":
+                clean_messages.append(msg)
+            elif msg.role == "assistant" and not (hasattr(msg, 'tool_calls') and msg.tool_calls):
+                clean_messages.append(msg)
+        else:
+            # Handle message dict format
+            if isinstance(msg, dict):
+                if msg.get('role') == 'user':
+                    clean_messages.append(msg)
+                elif msg.get('role') == 'assistant' and not msg.get('tool_calls'):
+                    clean_messages.append(msg)
 
-def update_profile_memory(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore):
+    # Create context for Beeb supervisor
+    context = {
+        "user_id": user_id,
+        "thread_id": thread_id,
+        "summary": summary,
+        "semantic_memory": formatted_semantic,
+        "episodic_memories": formatted_episodic,
+        "procedural_memory": formatted_procedural,
+        "scout_results": scout_results,
+        "memory_results": memory_results,
+        "scribe_results": scribe_results,
+        "messages": clean_messages
+    }
+
+    # Use Beeb supervisor to coordinate and respond
+    response = beeb_supervisor.invoke(context)
+    
+    # Check if Beeb made tool calls for delegation
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        # Return the response with tool calls for routing
+        return {"messages": [response]}
+    else:
+        # Beeb responded directly without delegation
+        return {"messages": [response]}
+
+def scout_bee_node(state: BargainBMemoryState, config: RunnableConfig):
+    """
+    Scout Bee node for product search and price comparison.
+    
+    This node:
+    - Receives product search tasks from Beeb
+    - Uses Scout Bee to search for products
+    - Returns search results to Beeb
+    """
+    
+    # Get the last message which should contain the search task
+    last_message = state["messages"][-1]
+    
+    # Check if this is a delegation to Scout Bee
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "assign_to_scout_bee":
+                search_task = tool_call["args"]["task_description"]
+                
+                # Use Scout Bee to process the search
+                search_state = {"messages": [{"role": "user", "content": search_task}]}
+                result = scout_bee(search_state)
+                
+                # Extract the search results
+                search_results = result["messages"][-1]["content"]
+                
+                # Return tool response and update state with results
+                tool_response = {
+                    "role": "tool",
+                    "content": search_results,
+                    "tool_call_id": tool_call["id"]
+                }
+                
+                return {
+                    "messages": [tool_response],
+                    "scout_results": search_results
+                }
+    
+    return {"messages": []}
+
+def memory_bee_node(state: BargainBMemoryState, config: RunnableConfig):
+    """
+    Memory Bee node for memory management and updates.
+    
+    This node:
+    - Receives memory update tasks from Beeb
+    - Uses Memory Bee and Trustcall to update memories
+    - Saves memories to the store
+    - Returns confirmation to Beeb
+    """
+    
+    # Get the last message which should contain the memory task
+    last_message = state["messages"][-1]
+    
+    # Check if this is a delegation to Memory Bee
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "assign_to_memory_bee":
+                memory_type = tool_call["args"]["memory_type"]
+                context = tool_call["args"]["context"]
+                
+                # Route to appropriate memory update based on type
+                if memory_type == "profile":
+                    result = update_profile_memory(state, config, store)
+                elif memory_type == "shopping":
+                    result = update_shopping_memory(state, config, store)
+                elif memory_type == "instructions":
+                    result = update_instructions_memory(state, config, store)
+                else:
+                    result = {"messages": [{"role": "tool", "content": f"Unknown memory type: {memory_type}", "tool_call_id": tool_call["id"]}]}
+                
+                # Add memory results to state
+                memory_results = f"Updated {memory_type} memory with: {context}"
+                result["memory_results"] = memory_results
+                
+                return result
+    
+    return {"messages": []}
+
+def scribe_bee_node(state: BargainBMemoryState, config: RunnableConfig):
+    """
+    Scribe Bee node for conversation summarization.
+    
+    This node:
+    - Receives summarization tasks from Beeb
+    - Uses Scribe Bee to summarize conversations
+    - Returns summarization results to Beeb
+    """
+    
+    # Get the last message which should contain the summarization task
+    last_message = state["messages"][-1]
+    
+    # Check if this is a delegation to Scribe Bee
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "assign_to_scribe_bee":
+                # Use the summarization logic
+                result = summarize_conversation(state, config)
+                
+                # Return tool response with summarization results
+                tool_response = {
+                    "role": "tool",
+                    "content": f"Conversation summarized and saved to database: {result['summary'][:100]}...",
+                    "tool_call_id": tool_call["id"]
+                }
+                
+                return {
+                    "messages": [tool_response],
+                    "scribe_results": f"Summarized and saved conversation: {result['summary'][:100]}...",
+                    "summary": result["summary"]
+                }
+    
+    return {"messages": []}
+
+# Memory management functions (adapted from mem.md patterns)
+def update_profile_memory(state: BargainBMemoryState, config: RunnableConfig):
     """Update user profile memory using Trustcall (like update_profile in mem.md)."""
     
     # Get the user ID from the config
@@ -313,7 +388,7 @@ def update_profile_memory(state: BargainBMemoryState, config: RunnableConfig, st
     tool_calls = state['messages'][-1].tool_calls
     return {"messages": [{"role": "tool", "content": "updated profile", "tool_call_id": tool_calls[0]['id']}]}
 
-def update_shopping_memory(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore):
+def update_shopping_memory(state: BargainBMemoryState, config: RunnableConfig):
     """Update shopping history memory using Trustcall (like update_todos in mem.md)."""
     
     # Get the user ID from the config
@@ -363,7 +438,7 @@ def update_shopping_memory(state: BargainBMemoryState, config: RunnableConfig, s
     
     return {"messages": [{"role": "tool", "content": shopping_update_msg, "tool_call_id": tool_calls[0]['id']}]}
 
-def update_instructions_memory(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore):
+def update_instructions_memory(state: BargainBMemoryState, config: RunnableConfig):
     """Update instructions memory (like update_instructions in mem.md)."""
     
     # Get the user ID from the config
@@ -388,68 +463,139 @@ def update_instructions_memory(state: BargainBMemoryState, config: RunnableConfi
     tool_calls = state['messages'][-1].tool_calls
     return {"messages": [{"role": "tool", "content": "updated instructions", "tool_call_id": tool_calls[0]['id']}]}
 
-def route_decisions(state: BargainBMemoryState, config: RunnableConfig, store: BaseStore) -> Literal[END, "update_shopping_memory", "update_instructions_memory", "update_profile_memory"]:
-    """Route decisions to appropriate handlers based on tool calls."""
+# Conversation summarization function following the document pattern
+def summarize_conversation(state: BargainBMemoryState, config: RunnableConfig):
+    """
+    Summarize the conversation and truncate messages following the external DB memory pattern.
     
-    message = state['messages'][-1]
+    This function:
+    1. Creates a summary of the conversation
+    2. Saves the summary to the database
+    3. Truncates messages to keep only the most recent ones
+    4. Logs the truncation event for tracking
+    """
     
-    # Check for tool calls
-    if hasattr(message, 'tool_calls') and message.tool_calls:
-        for tool_call in message.tool_calls:
-            # Handle memory updates
-            if tool_call.get('name') == 'UpdateMemory':
-                update_type = tool_call['args']['update_type']
-                if update_type == "profile":
-                    return "update_profile_memory"
-                elif update_type == "shopping":
-                    return "update_shopping_memory"
-                elif update_type == "instructions":
-                    return "update_instructions_memory"
-            
-            # Handle product search (already handled by the main agent)
-            elif tool_call.get('name') == 'search_products':
-                return END
+    # Get thread/user IDs for database storage
+    thread_id = config["configurable"].get("thread_id", "default")
+    user_id = config["configurable"].get("user_id", thread_id)
+    conversation_id = f"{user_id}_{thread_id}"
     
+    # Get existing summary if it exists
+    summary = state.get("summary", "")
+    
+    # Create our summarization prompt
+    if summary:
+        # A summary already exists - extend it
+        summary_message = (
+            f"This is summary of the conversation to date: {summary}\n\n"
+            "Extend the summary by taking into account the new messages above:"
+        )
+    else:
+        summary_message = "Create a summary of the conversation above:"
+    
+    # Add prompt to our history
+    messages = state["messages"] + [HumanMessage(content=summary_message)]
+    response = model.invoke(messages)
+    
+    # Save the conversation summary to database
+    try:
+        save_conversation_summary(
+            conversation_id=conversation_id,
+            thread_id=thread_id,
+            summary_text=response.content,
+            message_count=len(state["messages"]),
+            tokens_used=getattr(response, 'usage_metadata', {}).get('total_tokens', 0)
+        )
+        print(f"📝 Scribe Bee: Saved conversation summary to database for {conversation_id}")
+    except Exception as e:
+        print(f"❌ Scribe Bee: Failed to save conversation summary: {e}")
+    
+    # Delete all but the 2 most recent messages (following external DB pattern)
+    delete_messages = [RemoveMessage(id=m.id) for m in state["messages"][:-2]]
+    
+    # Log the truncation event to database
+    try:
+        log_truncation_db(
+            conversation_id=conversation_id,
+            thread_id=thread_id,
+            messages_before=len(state["messages"]),
+            messages_after=2,  # Keep only 2 most recent
+            messages_removed=len(delete_messages),
+            summary_tokens=getattr(response, 'usage_metadata', {}).get('total_tokens', 0)
+        )
+        print(f"📝 Scribe Bee: Logged message truncation for {conversation_id}")
+    except Exception as e:
+        print(f"❌ Scribe Bee: Failed to log message truncation: {e}")
+    
+    return {"summary": response.content, "messages": delete_messages}
+
+def route_decisions(state: BargainBMemoryState, config: RunnableConfig) -> Literal[END, "scout_bee_node", "memory_bee_node", "scribe_bee_node", "summarize_conversation"]:
+    """
+    Route decisions based on Beeb's tool calls and message count.
+    
+    This function:
+    1. First checks if summarization is needed (message count > 10)
+    2. Then checks for bee delegation based on tool calls
+    3. Otherwise ends the conversation
+    """
+    
+    # First, check if summarization is needed following document pattern
+    messages = state["messages"]
+    if len(messages) > 10:
+        return "summarize_conversation"
+    
+    # Check the last AI message for tool calls (bee delegation)
+    last_message = state["messages"][-1]
+    
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "assign_to_scout_bee":
+                return "scout_bee_node"
+            elif tool_call["name"] == "assign_to_memory_bee":
+                return "memory_bee_node"
+            elif tool_call["name"] == "assign_to_scribe_bee":
+                return "scribe_bee_node"
+    
+    # If no tool calls or summarization needed, end the conversation
     return END
 
 def create_bargainb_memory_agent():
     """
-    Create the full-featured BargainB memory agent with mem.md patterns.
+    Create the BargainB memory agent with bee delegation system.
     
-    This agent includes:
-    - Memory management following mem.md patterns
-    - Product search capabilities
+    This agent uses:
+    - Beeb Supervisor as the main interface
+    - Worker bees for specialized tasks (Scout, Memory, Scribe)
+    - Memory management with Trustcall
     - Conversation summarization
-    - Database integration
-    
-    Returns:
-        Compiled graph with full feature set
+    - Database integration for products and memory
+    - LangGraph platform built-in persistence
     """
     
-    # Create the graph following mem.md structure
+    # Create the graph with bee delegation system
     builder = StateGraph(BargainBMemoryState)
     
     # Define nodes
-    builder.add_node("bargainb_main_agent", bargainb_main_agent)
-    builder.add_node("update_profile_memory", update_profile_memory)
-    builder.add_node("update_shopping_memory", update_shopping_memory)
-    builder.add_node("update_instructions_memory", update_instructions_memory)
+    builder.add_node("beeb_main_node", beeb_main_node)
+    builder.add_node("scout_bee_node", scout_bee_node)
+    builder.add_node("memory_bee_node", memory_bee_node)
+    builder.add_node("scribe_bee_node", scribe_bee_node)
+    builder.add_node("summarize_conversation", summarize_conversation)
     
-    # Define the flow
-    builder.add_edge(START, "bargainb_main_agent")
-    builder.add_conditional_edges("bargainb_main_agent", route_decisions)
-    builder.add_edge("update_profile_memory", "bargainb_main_agent")
-    builder.add_edge("update_shopping_memory", "bargainb_main_agent")
-    builder.add_edge("update_instructions_memory", "bargainb_main_agent")
+    # Define the flow - start with Beeb, then route based on decisions
+    builder.add_edge(START, "beeb_main_node")
+    builder.add_conditional_edges("beeb_main_node", route_decisions)
     
-    # Store for long-term (across-thread) memory
-    across_thread_memory = InMemoryStore()
+    # Worker bees return to Beeb for coordination
+    builder.add_edge("scout_bee_node", "beeb_main_node")
+    builder.add_edge("memory_bee_node", "beeb_main_node")
+    builder.add_edge("scribe_bee_node", "beeb_main_node")
     
-    # Checkpointer for short-term (within-thread) memory
-    within_thread_memory = MemorySaver()
+    # Summarization ends the conversation
+    builder.add_edge("summarize_conversation", END)
     
-    # Compile the graph with store integration
-    graph = builder.compile(checkpointer=within_thread_memory, store=across_thread_memory)
+    # Compile the graph - LangGraph platform handles persistence automatically
+    graph = builder.compile()
     
     return graph
 
@@ -459,5 +605,4 @@ def create_bargainb_memory_agent_legacy():
     return create_bargainb_memory_agent()
 
 # Export the graph instance for LangGraph deployment
-# This is what langgraph.json expects to find
 memory_agent = create_bargainb_memory_agent() 
